@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 ratatui = "0.30.0"
+portable-pty = "0.8"
+vt100 = "0.15"
