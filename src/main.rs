@@ -168,7 +168,7 @@ fn parse_diff(raw: &str) -> Vec<FileDiff> {
 struct App {
     focused: Pane,
     git_tab: GitTab,
-    scroll_offsets: [u16; 3],
+    scroll_offsets: [u16; 4],
     file_diffs: Vec<FileDiff>,
     diff_file_idx: usize,
     diff_content_scroll: u16,
@@ -185,7 +185,7 @@ impl App {
         let mut app = Self {
             focused: Pane::Claude,
             git_tab: GitTab::Diff,
-            scroll_offsets: [0; 3],
+            scroll_offsets: [0; 4],
             file_diffs: Vec::new(),
             diff_file_idx: 0,
             diff_content_scroll: 0,
@@ -205,7 +205,7 @@ impl App {
         self.git_worktrees = run_command("git", &["worktree", "list", "--porcelain"]);
         self.git_branches = run_command("git", &["branch", "-a", "-vv"]);
         self.file_diffs = parse_diff(&run_command("git", &["diff"]));
-        self.scroll_offsets = [0; 3];
+        self.scroll_offsets = [0; 4];
         self.diff_file_idx = 0;
         self.diff_content_scroll = 0;
     }
