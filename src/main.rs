@@ -516,7 +516,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                     _ => {}
                 }
             }
-            KeyCode::Char('n') | KeyCode::Char('N') => { app.input_mode = None; app.input_buf.clear(); }
+            KeyCode::Char(c @ 'n') | KeyCode::Char(c @ 'N') => {
+                if matches!(app.input_mode, Some(InputMode::ConfirmDelete(_, _))) {
+                    app.input_mode = None;
+                    app.input_buf.clear();
+                } else if matches!(app.input_mode, Some(InputMode::NewWorktree))
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    app.input_buf.push(c);
+                }
+            }
             KeyCode::Backspace => {
                 if matches!(app.input_mode, Some(InputMode::NewWorktree)) { app.input_buf.pop(); }
             }
