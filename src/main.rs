@@ -19,7 +19,7 @@ use ratatui::Frame;
 // ── Pane / tab state ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pane { Claude, Git }
+enum Pane { Claude, Git, Terminal }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GitTab { Diff, Worktrees, Branches, Log }
@@ -37,28 +37,29 @@ impl GitTab {
     fn prev(self) -> Self { Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()] }
 }
 
-// ── Claude PTY session ────────────────────────────────────────────────────
+// ── PTY session ───────────────────────────────────────────────────────────
 
-struct ClaudeSession {
+struct PtySession {
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Box<dyn Write + Send>,
     child:  Box<dyn portable_pty::Child + Send + Sync>,
     master: Box<dyn MasterPty + Send>,
 }
 
-fn spawn_claude_session_in(path: &Path) -> Option<ClaudeSession> {
+fn spawn_pty_session(path: &Path, cmd: &str, args: &[&str], size: PtySize) -> Option<PtySession> {
     let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }).ok()?;
-    let mut cmd = CommandBuilder::new("claude");
-    cmd.cwd(path);
-    let child = pair.slave.spawn_command(cmd).ok()?;
+    let pair = pty_system.openpty(size).ok()?;
+    let mut builder = CommandBuilder::new(cmd);
+    for arg in args { builder.arg(arg); }
+    builder.cwd(path);
+    let child = pair.slave.spawn_command(builder).ok()?;
     drop(pair.slave);
     let writer = pair.master.take_writer().ok()?;
     let reader = pair.master.try_clone_reader().ok()?;
-    let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+    let parser = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 0)));
     let parser_clone = Arc::clone(&parser);
     std::thread::spawn(move || pty_reader_thread(reader, parser_clone));
-    Some(ClaudeSession { parser, writer, child, master: pair.master })
+    Some(PtySession { parser, writer, child, master: pair.master })
 }
 
 fn pty_reader_thread(mut reader: Box<dyn Read + Send>, parser: Arc<Mutex<vt100::Parser>>) {
@@ -214,7 +215,8 @@ fn parse_diff(raw: &str) -> Vec<FileDiff> {
 struct Window {
     name: String,
     path: PathBuf,
-    claude: Option<ClaudeSession>,
+    claude: Option<PtySession>,
+    terminal: Option<PtySession>,
     focused: Pane,
     git_tab: GitTab,
     scroll_offsets: [u16; 4],
@@ -232,10 +234,19 @@ struct Window {
 
 impl Window {
     fn new(path: PathBuf, name: String) -> Self {
-        let claude = spawn_claude_session_in(&path);
+        let claude = spawn_pty_session(
+            &path, "claude", &[],
+            PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+        );
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let terminal = spawn_pty_session(
+            &path, &shell, &[],
+            PtySize { rows: 12, cols: 80, pixel_width: 0, pixel_height: 0 },
+        );
         let mut win = Self {
             name, path,
             claude,
+            terminal,
             focused: Pane::Claude,
             git_tab: GitTab::Diff,
             scroll_offsets: [0; 4],
@@ -266,9 +277,17 @@ impl Window {
         self.worktree_selected = self.worktree_selected.min(self.git_worktrees.len().saturating_sub(1));
     }
 
-    fn resize_pty(&mut self, cols: u16, rows: u16) {
+    fn resize_claude_pty(&mut self, cols: u16, rows: u16) {
         let (cols, rows) = (cols.max(1), rows.max(1));
         if let Some(ref mut s) = self.claude {
+            let _ = s.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+            if let Ok(mut p) = s.parser.lock() { p.set_size(rows, cols); }
+        }
+    }
+
+    fn resize_terminal_pty(&mut self, cols: u16, rows: u16) {
+        let (cols, rows) = (cols.max(1), rows.max(1));
+        if let Some(ref mut s) = self.terminal {
             let _ = s.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
             if let Ok(mut p) = s.parser.lock() { p.set_size(rows, cols); }
         }
@@ -358,7 +377,8 @@ impl App {
 
     fn close_window(&mut self, idx: usize) {
         if let Some(win) = self.windows.get_mut(idx) {
-            if let Some(ref mut s) = win.claude { let _ = s.child.kill(); }
+            if let Some(ref mut s) = win.claude    { let _ = s.child.kill(); }
+            if let Some(ref mut s) = win.terminal  { let _ = s.child.kill(); }
         }
         self.windows.remove(idx);
         if self.windows.is_empty() {
@@ -449,10 +469,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
     let mut app = App::new();
 
     let size = terminal.size()?;
-    let content_rows = size.height.saturating_sub(1); // minus window tab bar
-    let pty_cols = (size.width / 2).saturating_sub(2);
-    let pty_rows = content_rows.saturating_sub(2);
-    for win in &mut app.windows { win.resize_pty(pty_cols, pty_rows); }
+    let content_rows = size.height.saturating_sub(1);
+    let half_cols = (size.width / 2).saturating_sub(2);
+    let claude_rows = content_rows.saturating_sub(2);
+    let term_rows = (content_rows * 40 / 100).saturating_sub(2).max(1);
+    for win in &mut app.windows {
+        win.resize_claude_pty(half_cols, claude_rows);
+        win.resize_terminal_pty(half_cols, term_rows);
+    }
 
     while !app.should_quit {
         terminal.draw(|frame| render(&app, frame))?;
@@ -466,7 +490,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
     }
 
     for win in &mut app.windows {
-        if let Some(ref mut s) = win.claude { let _ = s.child.kill(); }
+        if let Some(ref mut s) = win.claude   { let _ = s.child.kill(); }
+        if let Some(ref mut s) = win.terminal { let _ = s.child.kill(); }
     }
     Ok(())
 }
@@ -475,13 +500,18 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
 
 fn handle_resize(app: &mut App, total_cols: u16, total_rows: u16) {
     let content_rows = total_rows.saturating_sub(1);
+    let half_cols = (total_cols / 2).saturating_sub(2);
     for win in &mut app.windows {
-        let (pty_cols, pty_rows) = if win.fullscreen && win.focused == Pane::Claude {
-            (total_cols.saturating_sub(2), content_rows.saturating_sub(2))
+        let claude_cols = if win.fullscreen && win.focused == Pane::Claude {
+            total_cols.saturating_sub(2)
         } else {
-            ((total_cols / 2).saturating_sub(2), content_rows.saturating_sub(2))
+            half_cols
         };
-        win.resize_pty(pty_cols, pty_rows);
+        win.resize_claude_pty(claude_cols, content_rows.saturating_sub(2));
+        if !win.fullscreen {
+            let term_rows = (content_rows * 40 / 100).saturating_sub(2).max(1);
+            win.resize_terminal_pty(half_cols, term_rows);
+        }
     }
 }
 
@@ -538,10 +568,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // Global bindings
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), KeyModifiers::CONTROL) => { app.should_quit = true; return; }
-        // Ctrl+W switches Claude↔Git pane
+        // Ctrl+W cycles Claude → Git → Terminal → Claude
         (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
             let win = app.win_mut();
-            win.focused = match win.focused { Pane::Claude => Pane::Git, Pane::Git => Pane::Claude };
+            win.focused = match win.focused {
+                Pane::Claude   => Pane::Git,
+                Pane::Git      => Pane::Terminal,
+                Pane::Terminal => Pane::Claude,
+            };
             return;
         }
         // Window cycling (Ctrl+N / Ctrl+P)
@@ -559,6 +593,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     match app.win().focused {
         Pane::Claude => {
             if let Some(ref mut s) = app.win_mut().claude {
+                let bytes = key_to_bytes(&key);
+                if !bytes.is_empty() { let _ = s.writer.write_all(&bytes); }
+            }
+        }
+        Pane::Terminal => {
+            if let Some(ref mut s) = app.win_mut().terminal {
                 let bytes = key_to_bytes(&key);
                 if !bytes.is_empty() { let _ = s.writer.write_all(&bytes); }
             }
@@ -693,17 +733,19 @@ fn render(app: &App, frame: &mut Frame) {
     let active = Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD);
 
     if win.fullscreen {
-        match win.focused {
-            Pane::Claude => render_claude_pane(win, frame, content_area, true, normal, active),
-            Pane::Git    => render_git_pane(win, frame, content_area, true, normal, active, &app.open_paths()),
-        }
+        // Only git uses fullscreen; terminal keeps running but is hidden
+        render_git_pane(win, frame, content_area, win.focused == Pane::Git, normal, active, &app.open_paths());
         return;
     }
 
     let [left, right] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .areas(content_area);
-    render_claude_pane(win, frame, left,  win.focused == Pane::Claude, normal, active);
-    render_git_pane(win, frame, right, win.focused == Pane::Git, normal, active, &app.open_paths());
+    let [git_area, term_area] = Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .areas(right);
+
+    render_claude_pane(win, frame, left, win.focused == Pane::Claude, normal, active);
+    render_git_pane(win, frame, git_area, win.focused == Pane::Git, normal, active, &app.open_paths());
+    render_terminal_pane(win, frame, term_area, win.focused == Pane::Terminal, normal, active);
 
     if app.input_mode.is_some() {
         render_input_prompt(app, frame);
@@ -785,13 +827,18 @@ fn render_input_prompt(app: &App, frame: &mut Frame) {
     }
 }
 
-// ── Claude pane ───────────────────────────────────────────────────────────
+// ── PTY pane rendering ────────────────────────────────────────────────────
 
-fn render_claude_pane(win: &Window, frame: &mut Frame, area: Rect, focused: bool, normal: Style, active: Style) {
-    let border_style = if focused { active } else { normal };
-    let hint = if focused { " ^W pane  ^W→Git  ^]close  ^Q quit " } else { "" };
-    let title = if focused { format!(" {} * ", win.name) } else { format!(" {} ", win.name) };
-
+fn render_pty_pane(
+    session: Option<&PtySession>,
+    frame: &mut Frame,
+    area: Rect,
+    focused: bool,
+    title: String,
+    hint: &str,
+    border_style: Style,
+    fail_msg: &str,
+) {
     let block = Block::bordered()
         .border_style(border_style)
         .title(title)
@@ -799,10 +846,9 @@ fn render_claude_pane(win: &Window, frame: &mut Frame, area: Rect, focused: bool
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let Some(ref session) = win.claude else {
+    let Some(session) = session else {
         frame.render_widget(
-            Paragraph::new("Failed to start claude CLI.\nEnsure `claude` is on PATH.")
-                .style(Style::default().fg(Color::Red)),
+            Paragraph::new(fail_msg.to_string()).style(Style::default().fg(Color::Red)),
             inner,
         );
         return;
@@ -845,6 +891,28 @@ fn render_claude_pane(win: &Window, frame: &mut Frame, area: Rect, focused: bool
             frame.set_cursor_position((cx, cy));
         }
     }
+}
+
+fn render_claude_pane(win: &Window, frame: &mut Frame, area: Rect, focused: bool, normal: Style, active: Style) {
+    let border_style = if focused { active } else { normal };
+    let hint = if focused { " ^W pane  ^Q quit " } else { "" };
+    let title = if focused { format!(" {} * ", win.name) } else { format!(" {} ", win.name) };
+    render_pty_pane(
+        win.claude.as_ref(), frame, area, focused,
+        title, hint, border_style,
+        "Failed to start claude CLI.\nEnsure `claude` is on PATH.",
+    );
+}
+
+fn render_terminal_pane(win: &Window, frame: &mut Frame, area: Rect, focused: bool, normal: Style, active: Style) {
+    let border_style = if focused { active } else { normal };
+    let hint = if focused { " ^W pane  ^Q quit " } else { "" };
+    let title = if focused { " Terminal * ".to_string() } else { " Terminal ".to_string() };
+    render_pty_pane(
+        win.terminal.as_ref(), frame, area, focused,
+        title, hint, border_style,
+        "Failed to start shell.\nCheck $SHELL.",
+    );
 }
 
 fn cell_to_style(cell: &vt100::Cell) -> Style {
