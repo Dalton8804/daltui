@@ -654,6 +654,11 @@ fn render_window_bar(app: &App, frame: &mut Frame, area: Rect) {
         .highlight_style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
         .divider("│");
     frame.render_widget(tabs, area);
+
+    let title = Paragraph::new("datui")
+        .style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
+        .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(title, area);
 }
 
 fn render_input_prompt(app: &App, frame: &mut Frame) {
