@@ -1,0 +1,276 @@
+use std::io::Write;
+
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+use crate::app::{App, GitTab, InputMode, Pane};
+
+pub fn handle_resize(app: &mut App, total_cols: u16, total_rows: u16) {
+    let content_rows = total_rows.saturating_sub(1);
+    let half_cols = (total_cols / 2).saturating_sub(2);
+    for win in &mut app.windows {
+        let claude_cols = if win.fullscreen && win.focused == Pane::Claude {
+            total_cols.saturating_sub(2)
+        } else {
+            half_cols
+        };
+        win.resize_claude_pty(claude_cols, content_rows.saturating_sub(2));
+        if !win.fullscreen {
+            let term_rows = (content_rows * 40 / 100).saturating_sub(2).max(1);
+            win.resize_terminal_pty(half_cols, term_rows);
+        }
+    }
+}
+
+pub fn handle_key(app: &mut App, key: KeyEvent) {
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+
+    if app.input_mode.is_some() {
+        handle_input_mode(app, key);
+        return;
+    }
+
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+            return;
+        }
+        (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
+            let win = app.win_mut();
+            win.focused = match win.focused {
+                Pane::Claude => Pane::Git,
+                Pane::Git => Pane::Terminal,
+                Pane::Terminal => Pane::Claude,
+            };
+            return;
+        }
+        (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            app.next_window();
+            return;
+        }
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            app.prev_window();
+            return;
+        }
+        (KeyCode::Char('x'), KeyModifiers::CONTROL) => {
+            let idx = app.active;
+            app.close_window(idx);
+            return;
+        }
+        _ => {}
+    }
+
+    match app.win().focused {
+        Pane::Claude => {
+            if let Some(ref mut s) = app.win_mut().claude {
+                let bytes = key_to_bytes(&key);
+                if !bytes.is_empty() {
+                    let _ = s.writer.write_all(&bytes);
+                }
+            }
+        }
+        Pane::Terminal => {
+            if let Some(ref mut s) = app.win_mut().terminal {
+                let bytes = key_to_bytes(&key);
+                if !bytes.is_empty() {
+                    let _ = s.writer.write_all(&bytes);
+                }
+            }
+        }
+        Pane::Git => handle_git_key(app, key),
+    }
+}
+
+fn handle_input_mode(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.input_mode = None;
+            app.input_buf.clear();
+        }
+        KeyCode::Enter => match app.input_mode.take() {
+            Some(InputMode::NewWorktree) => {
+                let name = app.input_buf.trim().to_string();
+                app.input_buf.clear();
+                if !name.is_empty() {
+                    app.create_worktree(&name);
+                }
+            }
+            Some(InputMode::ConfirmDelete(_, _)) | Some(InputMode::ConfirmDeleteBranch(_)) => {
+                app.input_buf.clear();
+            }
+            None => {}
+        },
+        KeyCode::Char('y') | KeyCode::Char('Y') => match app.input_mode.take() {
+            Some(InputMode::ConfirmDelete(path, name)) => {
+                app.input_buf.clear();
+                app.delete_worktree(&path, &name);
+            }
+            Some(InputMode::ConfirmDeleteBranch(name)) => {
+                app.input_buf.clear();
+                app.delete_branch(&name);
+            }
+            _ => {}
+        },
+        KeyCode::Char(c @ 'n') | KeyCode::Char(c @ 'N') => {
+            if matches!(app.input_mode, Some(InputMode::ConfirmDelete(_, _))) {
+                app.input_mode = None;
+                app.input_buf.clear();
+            } else if matches!(app.input_mode, Some(InputMode::NewWorktree))
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                app.input_buf.push(c);
+            }
+        }
+        KeyCode::Backspace => {
+            if matches!(app.input_mode, Some(InputMode::NewWorktree)) {
+                app.input_buf.pop();
+            }
+        }
+        KeyCode::Char(c)
+            if matches!(app.input_mode, Some(InputMode::NewWorktree))
+                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.input_buf.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_git_key(app: &mut App, key: KeyEvent) {
+    use KeyCode::*;
+    use KeyModifiers as KM;
+
+    if app.win().git_tab == GitTab::Worktrees {
+        match (key.code, key.modifiers) {
+            (Enter, _) => {
+                let path = app
+                    .win()
+                    .git_worktrees
+                    .get(app.win().worktree_selected)
+                    .map(|wt| wt.path.clone());
+                if let Some(p) = path {
+                    app.open_window(p);
+                }
+                return;
+            }
+            (Char('t'), KM::CONTROL) => {
+                app.input_mode = Some(InputMode::NewWorktree);
+                app.input_buf.clear();
+                return;
+            }
+            (Char('d'), KM::NONE) => {
+                let sel = app.win().worktree_selected;
+                if let Some(wt) = app.win().git_worktrees.get(sel) {
+                    if wt.path != app.win().path {
+                        app.input_mode =
+                            Some(InputMode::ConfirmDelete(wt.path.clone(), wt.name.clone()));
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    if app.win().git_tab == GitTab::Branches {
+        if let (Char('d'), KM::NONE) = (key.code, key.modifiers) {
+            let sel = app.win().branch_selected;
+            if let Some(branch) = app.win().git_branches.get(sel) {
+                if !branch.is_current {
+                    app.input_mode = Some(InputMode::ConfirmDeleteBranch(branch.name.clone()));
+                }
+            }
+            return;
+        }
+    }
+
+    match (key.code, key.modifiers) {
+        (Char('c'), KM::CONTROL) | (Char('q'), KM::NONE) => app.should_quit = true,
+        _ => {}
+    }
+
+    let win = app.win_mut();
+    match (key.code, key.modifiers) {
+        (Char('f'), KM::CONTROL) => {
+            win.fullscreen = !win.fullscreen;
+            win.diff_content_scroll = 0;
+        }
+        (Char('r'), KM::CONTROL) => win.refresh(),
+        (Char('e'), KM::NONE) if win.git_tab == GitTab::Diff => {
+            win.diff_show_list = !win.diff_show_list;
+        }
+        (Right, _) => win.git_tab = win.git_tab.next(),
+        (Left, _) => win.git_tab = win.git_tab.prev(),
+        (Up, _) if win.git_tab == GitTab::Worktrees => {
+            win.worktree_selected = win.worktree_selected.saturating_sub(1);
+        }
+        (Down, _) if win.git_tab == GitTab::Worktrees => {
+            let max = win.git_worktrees.len().saturating_sub(1);
+            win.worktree_selected = (win.worktree_selected + 1).min(max);
+        }
+        (Up, _) if win.git_tab == GitTab::Branches => {
+            win.branch_selected = win.branch_selected.saturating_sub(1);
+        }
+        (Down, _) if win.git_tab == GitTab::Branches => {
+            let max = win.git_branches.len().saturating_sub(1);
+            win.branch_selected = (win.branch_selected + 1).min(max);
+        }
+        (Up, _) if win.git_tab == GitTab::Diff && win.diff_show_list => win.diff_select_prev(),
+        (Down, _) if win.git_tab == GitTab::Diff && win.diff_show_list => win.diff_select_next(),
+        (Up, _) => win.scroll_up(1),
+        (Down, _) => win.scroll_down(1),
+        (Char('k'), KM::NONE) => win.scroll_up(20),
+        (Char('j'), KM::NONE) => win.scroll_down(20),
+        _ => {}
+    }
+}
+
+fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {
+    use KeyCode::*;
+    use KeyModifiers as KM;
+    match key.code {
+        Char(c) => {
+            if key.modifiers.contains(KM::CONTROL) {
+                let b = (c as u8).to_ascii_uppercase();
+                vec![if (b'A'..=b'Z').contains(&b) { b - b'A' + 1 } else { c as u8 & 0x1F }]
+            } else if key.modifiers.contains(KM::ALT) {
+                let mut v = vec![0x1B];
+                let mut tmp = [0u8; 4];
+                v.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+                v
+            } else {
+                let mut tmp = [0u8; 4];
+                c.encode_utf8(&mut tmp).as_bytes().to_vec()
+            }
+        }
+        Enter => vec![b'\r'],
+        Backspace => vec![0x7F],
+        Delete => vec![0x1B, b'[', b'3', b'~'],
+        Esc => vec![0x1B],
+        Tab => vec![b'\t'],
+        BackTab => vec![0x1B, b'[', b'Z'],
+        Up => vec![0x1B, b'[', b'A'],
+        Down => vec![0x1B, b'[', b'B'],
+        Right => vec![0x1B, b'[', b'C'],
+        Left => vec![0x1B, b'[', b'D'],
+        Home => vec![0x1B, b'[', b'H'],
+        End => vec![0x1B, b'[', b'F'],
+        PageUp => vec![0x1B, b'[', b'5', b'~'],
+        PageDown => vec![0x1B, b'[', b'6', b'~'],
+        Insert => vec![0x1B, b'[', b'2', b'~'],
+        F(1) => vec![0x1B, b'O', b'P'],
+        F(2) => vec![0x1B, b'O', b'Q'],
+        F(3) => vec![0x1B, b'O', b'R'],
+        F(4) => vec![0x1B, b'O', b'S'],
+        F(5) => vec![0x1B, b'[', b'1', b'5', b'~'],
+        F(6) => vec![0x1B, b'[', b'1', b'7', b'~'],
+        F(7) => vec![0x1B, b'[', b'1', b'8', b'~'],
+        F(8) => vec![0x1B, b'[', b'1', b'9', b'~'],
+        F(9) => vec![0x1B, b'[', b'2', b'0', b'~'],
+        F(10) => vec![0x1B, b'[', b'2', b'1', b'~'],
+        F(11) => vec![0x1B, b'[', b'2', b'3', b'~'],
+        F(12) => vec![0x1B, b'[', b'2', b'4', b'~'],
+        _ => vec![],
+    }
+}
