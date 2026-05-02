@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,20 +22,16 @@ use ratatui::Frame;
 enum Pane { Claude, Git }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GitTab { Log, Worktrees, Branches, Diff }
+enum GitTab { Diff, Worktrees, Branches, Log }
 
 impl GitTab {
     const ALL: [GitTab; 4] = [GitTab::Diff, GitTab::Worktrees, GitTab::Branches, GitTab::Log];
-
     fn title(self) -> &'static str {
         match self {
-            GitTab::Diff => " Diff ",
-            GitTab::Worktrees => " Worktrees ",
-            GitTab::Branches => " Branches ",
-            GitTab::Log => " Log ",
+            GitTab::Diff => " Diff ", GitTab::Worktrees => " Worktrees ",
+            GitTab::Branches => " Branches ", GitTab::Log => " Log ",
         }
     }
-
     fn index(self) -> usize { Self::ALL.iter().position(|t| *t == self).unwrap() }
     fn next(self) -> Self { Self::ALL[(self.index() + 1) % Self::ALL.len()] }
     fn prev(self) -> Self { Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()] }
@@ -48,21 +46,18 @@ struct ClaudeSession {
     master: Box<dyn MasterPty + Send>,
 }
 
-fn spawn_claude_session() -> Option<ClaudeSession> {
+fn spawn_claude_session_in(path: &Path) -> Option<ClaudeSession> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }).ok()?;
-
-    let child = pair.slave.spawn_command(CommandBuilder::new("claude")).ok()?;
-    drop(pair.slave); // must drop slave in parent or reads block after child exits
-
+    let mut cmd = CommandBuilder::new("claude");
+    cmd.cwd(path);
+    let child = pair.slave.spawn_command(cmd).ok()?;
+    drop(pair.slave);
     let writer = pair.master.take_writer().ok()?;
     let reader = pair.master.try_clone_reader().ok()?;
-
     let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
     let parser_clone = Arc::clone(&parser);
-
     std::thread::spawn(move || pty_reader_thread(reader, parser_clone));
-
     Some(ClaudeSession { parser, writer, child, master: pair.master })
 }
 
@@ -71,13 +66,43 @@ fn pty_reader_thread(mut reader: Box<dyn Read + Send>, parser: Arc<Mutex<vt100::
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if let Ok(mut p) = parser.lock() {
-                    p.process(&buf[..n]);
-                }
-            }
+            Ok(n) => { if let Ok(mut p) = parser.lock() { p.process(&buf[..n]); } }
         }
     }
+}
+
+// ── Worktree parsing ──────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct Worktree {
+    path: PathBuf,
+    name: String, // branch short name or "(detached)"
+}
+
+fn parse_worktrees(raw: &str) -> Vec<Worktree> {
+    raw.split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .filter_map(|block| {
+            let mut path: Option<PathBuf> = None;
+            let mut name: Option<String> = None;
+            let mut detached = false;
+            for line in block.lines() {
+                if let Some(p) = line.strip_prefix("worktree ") {
+                    path = Some(PathBuf::from(p.trim()));
+                } else if let Some(b) = line.strip_prefix("branch ") {
+                    name = Some(b.trim().trim_start_matches("refs/heads/").to_string());
+                } else if line.trim() == "detached" || line.trim() == "bare" {
+                    detached = true;
+                }
+            }
+            let path = path?;
+            let name = name.unwrap_or_else(|| {
+                if detached { "(detached)".to_string() }
+                else { path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "?".to_string()) }
+            });
+            Some(Worktree { path, name })
+        })
+        .collect()
 }
 
 // ── Diff parsing ──────────────────────────────────────────────────────────
@@ -87,10 +112,8 @@ enum SbsKind { Context, Removed, Added, Changed, Header }
 
 #[derive(Clone)]
 struct SbsRow {
-    left_no: Option<usize>,
-    left: String,
-    right_no: Option<usize>,
-    right: String,
+    left_no: Option<usize>, left: String,
+    right_no: Option<usize>, right: String,
     kind: SbsKind,
 }
 
@@ -105,12 +128,9 @@ fn parse_hunk_start(line: &str) -> Option<(usize, usize)> {
 }
 
 fn flush_sbs(rows: &mut Vec<SbsRow>, rem: &mut Vec<(usize, String)>, add: &mut Vec<(usize, String)>) {
-    let n = rem.len().max(add.len());
-    for i in 0..n {
+    for i in 0..rem.len().max(add.len()) {
         let kind = match (i < rem.len(), i < add.len()) {
-            (true, true) => SbsKind::Changed,
-            (true, false) => SbsKind::Removed,
-            _ => SbsKind::Added,
+            (true, true) => SbsKind::Changed, (true, false) => SbsKind::Removed, _ => SbsKind::Added,
         };
         let (l_no, l) = rem.get(i).cloned().unwrap_or_default();
         let (r_no, r) = add.get(i).cloned().unwrap_or_default();
@@ -160,9 +180,7 @@ fn parse_diff(raw: &str) -> Vec<FileDiff> {
             }
             filename = rest.split_whitespace().nth(1).unwrap_or(rest).trim_start_matches("b/").to_string();
             content = line.to_string();
-        } else {
-            content.push('\n'); content.push_str(line);
-        }
+        } else { content.push('\n'); content.push_str(line); }
     }
     if !filename.is_empty() {
         result.push(FileDiff { filename, sbs: parse_side_by_side(&content), content });
@@ -170,9 +188,12 @@ fn parse_diff(raw: &str) -> Vec<FileDiff> {
     result
 }
 
-// ── App state ─────────────────────────────────────────────────────────────
+// ── Window ────────────────────────────────────────────────────────────────
 
-struct App {
+struct Window {
+    name: String,
+    path: PathBuf,
+    claude: Option<ClaudeSession>,
     focused: Pane,
     git_tab: GitTab,
     scroll_offsets: [u16; 4],
@@ -180,17 +201,19 @@ struct App {
     diff_file_idx: usize,
     diff_content_scroll: u16,
     diff_show_list: bool,
-    should_quit: bool,
     fullscreen: bool,
     git_log: String,
-    git_worktrees: String,
+    git_worktrees: Vec<Worktree>,
+    worktree_selected: usize,
     git_branches: String,
-    claude: Option<ClaudeSession>,
 }
 
-impl App {
-    fn new() -> Self {
-        let mut app = Self {
+impl Window {
+    fn new(path: PathBuf, name: String) -> Self {
+        let claude = spawn_claude_session_in(&path);
+        let mut win = Self {
+            name, path,
+            claude,
             focused: Pane::Claude,
             git_tab: GitTab::Diff,
             scroll_offsets: [0; 4],
@@ -198,44 +221,40 @@ impl App {
             diff_file_idx: 0,
             diff_content_scroll: 0,
             diff_show_list: true,
-            should_quit: false,
             fullscreen: false,
             git_log: String::new(),
-            git_worktrees: String::new(),
+            git_worktrees: Vec::new(),
+            worktree_selected: 0,
             git_branches: String::new(),
-            claude: spawn_claude_session(),
         };
-        app.refresh();
-        app
+        win.refresh();
+        win
     }
 
     fn refresh(&mut self) {
-        self.git_log = run_command("git", &["log", "--oneline", "--graph", "--decorate", "--color=never", "-100"]);
-        self.git_worktrees = run_command("git", &["worktree", "list", "--porcelain"]);
-        self.git_branches = run_command("git", &["branch", "-a", "-vv"]);
-        self.file_diffs = parse_diff(&run_command("git", &["diff"]));
+        self.git_log = run_in(&self.path, "git", &["log", "--oneline", "--graph", "--decorate", "--color=never", "-100"]);
+        self.git_worktrees = parse_worktrees(&run_in(&self.path, "git", &["worktree", "list", "--porcelain"]));
+        self.git_branches = run_in(&self.path, "git", &["branch", "-a", "-vv"]);
+        self.file_diffs = parse_diff(&run_in(&self.path, "git", &["diff"]));
         self.scroll_offsets = [0; 4];
         self.diff_file_idx = 0;
         self.diff_content_scroll = 0;
+        self.worktree_selected = self.worktree_selected.min(self.git_worktrees.len().saturating_sub(1));
     }
 
-    fn resize_claude_pty(&mut self, cols: u16, rows: u16) {
-        let cols = cols.max(1);
-        let rows = rows.max(1);
+    fn resize_pty(&mut self, cols: u16, rows: u16) {
+        let (cols, rows) = (cols.max(1), rows.max(1));
         if let Some(ref mut s) = self.claude {
             let _ = s.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
-            if let Ok(mut p) = s.parser.lock() {
-                p.set_size(rows, cols);
-            }
+            if let Ok(mut p) = s.parser.lock() { p.set_size(rows, cols); }
         }
     }
 
     fn simple_tab_content(&self) -> &str {
         match self.git_tab {
             GitTab::Log => &self.git_log,
-            GitTab::Worktrees => &self.git_worktrees,
             GitTab::Branches => &self.git_branches,
-            GitTab::Diff => "",
+            GitTab::Diff | GitTab::Worktrees => "",
         }
     }
 
@@ -281,16 +300,111 @@ impl App {
     }
 }
 
-// ── Shell helper ──────────────────────────────────────────────────────────
+// ── App ───────────────────────────────────────────────────────────────────
 
-fn run_command(cmd: &str, args: &[&str]) -> String {
-    Command::new(cmd).args(args).output()
+enum InputMode { NewWorktree, ConfirmDelete(PathBuf, String) }
+
+struct App {
+    windows: Vec<Window>,
+    active: usize,
+    should_quit: bool,
+    input_mode: Option<InputMode>,
+    input_buf: String,
+}
+
+impl App {
+    fn new() -> Self {
+        let path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let name = branch_name_for(&path);
+        let win = Window::new(path, name);
+        Self { windows: vec![win], active: 0, should_quit: false, input_mode: None, input_buf: String::new() }
+    }
+
+    fn win(&self) -> &Window { &self.windows[self.active] }
+    fn win_mut(&mut self) -> &mut Window { &mut self.windows[self.active] }
+
+    fn open_window(&mut self, path: PathBuf) {
+        if let Some(idx) = self.windows.iter().position(|w| w.path == path) {
+            self.active = idx;
+            return;
+        }
+        let name = branch_name_for(&path);
+        self.windows.push(Window::new(path, name));
+        self.active = self.windows.len() - 1;
+    }
+
+    fn close_window(&mut self, idx: usize) {
+        if let Some(win) = self.windows.get_mut(idx) {
+            if let Some(ref mut s) = win.claude { let _ = s.child.kill(); }
+        }
+        self.windows.remove(idx);
+        if self.windows.is_empty() {
+            self.should_quit = true;
+        } else {
+            self.active = self.active.min(self.windows.len() - 1);
+        }
+    }
+
+    fn next_window(&mut self) { self.active = (self.active + 1) % self.windows.len(); }
+    fn prev_window(&mut self) { self.active = (self.active + self.windows.len() - 1) % self.windows.len(); }
+
+    fn delete_worktree(&mut self, path: &Path, name: &str) {
+        // Close any window open on this worktree first
+        if let Some(idx) = self.windows.iter().position(|w| w.path == path) {
+            self.close_window(idx);
+        }
+        let base = self.win().path.clone();
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force", path.to_str().unwrap_or(name)])
+            .current_dir(&base)
+            .output();
+        self.win_mut().refresh();
+    }
+
+    fn create_worktree(&mut self, name: &str) {
+        let base = self.win().path.clone();
+        let target = base.parent().unwrap_or(&base).join(name);
+        let ok = Command::new("git")
+            .args(["worktree", "add", "-b", name, target.to_str().unwrap_or(name)])
+            .current_dir(&base)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            self.win_mut().refresh();
+            self.open_window(target);
+        }
+    }
+
+    fn open_paths(&self) -> HashSet<PathBuf> {
+        self.windows.iter().map(|w| w.path.clone()).collect()
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+fn run_in(dir: &Path, cmd: &str, args: &[&str]) -> String {
+    Command::new(cmd).args(args).current_dir(dir).output()
         .map(|o| {
             let out = String::from_utf8_lossy(&o.stdout).into_owned();
             let err = String::from_utf8_lossy(&o.stderr).into_owned();
             if out.is_empty() && !err.is_empty() { err } else { out }
         })
         .unwrap_or_else(|e| format!("error: {e}"))
+}
+
+fn branch_name_for(path: &Path) -> String {
+    Command::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .current_dir(path)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "main".to_string())
+        })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────
@@ -305,15 +419,14 @@ fn main() -> std::io::Result<()> {
 fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
     let mut app = App::new();
 
-    // Size the PTY to match the actual pane on startup
     let size = terminal.size()?;
+    let content_rows = size.height.saturating_sub(1); // minus window tab bar
     let pty_cols = (size.width / 2).saturating_sub(2);
-    let pty_rows = size.height.saturating_sub(2);
-    app.resize_claude_pty(pty_cols, pty_rows);
+    let pty_rows = content_rows.saturating_sub(2);
+    for win in &mut app.windows { win.resize_pty(pty_cols, pty_rows); }
 
     while !app.should_quit {
         terminal.draw(|frame| render(&app, frame))?;
-        // Poll 16ms so PTY output causes continuous redraws without blocking
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(key) => handle_key(&mut app, key),
@@ -323,8 +436,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
         }
     }
 
-    if let Some(ref mut s) = app.claude {
-        let _ = s.child.kill();
+    for win in &mut app.windows {
+        if let Some(ref mut s) = win.claude { let _ = s.child.kill(); }
     }
     Ok(())
 }
@@ -332,36 +445,78 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
 // ── Events ────────────────────────────────────────────────────────────────
 
 fn handle_resize(app: &mut App, total_cols: u16, total_rows: u16) {
-    let pty_cols = if app.fullscreen && app.focused == Pane::Claude {
-        total_cols.saturating_sub(2)
-    } else {
-        (total_cols / 2).saturating_sub(2)
-    };
-    let pty_rows = total_rows.saturating_sub(2);
-    app.resize_claude_pty(pty_cols, pty_rows);
+    let content_rows = total_rows.saturating_sub(1);
+    for win in &mut app.windows {
+        let (pty_cols, pty_rows) = if win.fullscreen && win.focused == Pane::Claude {
+            (total_cols.saturating_sub(2), content_rows.saturating_sub(2))
+        } else {
+            ((total_cols / 2).saturating_sub(2), content_rows.saturating_sub(2))
+        };
+        win.resize_pty(pty_cols, pty_rows);
+    }
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
     if key.kind != KeyEventKind::Press { return; }
 
-    // Global: Ctrl+Q always quits
-    if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.should_quit = true;
-        return;
-    }
-    // Global: Ctrl+W switches panes
-    if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.focused = match app.focused { Pane::Claude => Pane::Git, Pane::Git => Pane::Claude };
+    // Input prompt mode
+    if app.input_mode.is_some() {
+        match key.code {
+            KeyCode::Esc => { app.input_mode = None; app.input_buf.clear(); }
+            KeyCode::Enter => {
+                match app.input_mode.take() {
+                    Some(InputMode::NewWorktree) => {
+                        let name = app.input_buf.trim().to_string();
+                        app.input_buf.clear();
+                        if !name.is_empty() { app.create_worktree(&name); }
+                    }
+                    Some(InputMode::ConfirmDelete(_, _)) => { app.input_buf.clear(); }
+                    None => {}
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(InputMode::ConfirmDelete(path, name)) = app.input_mode.take() {
+                    app.input_buf.clear();
+                    app.delete_worktree(&path, &name);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => { app.input_mode = None; app.input_buf.clear(); }
+            KeyCode::Backspace => {
+                if matches!(app.input_mode, Some(InputMode::NewWorktree)) { app.input_buf.pop(); }
+            }
+            KeyCode::Char(c) if matches!(app.input_mode, Some(InputMode::NewWorktree))
+                && !key.modifiers.contains(KeyModifiers::CONTROL) => { app.input_buf.push(c); }
+            _ => {}
+        }
         return;
     }
 
-    match app.focused {
+    // Global bindings
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('q'), KeyModifiers::CONTROL) => { app.should_quit = true; return; }
+        // Ctrl+W switches Claude↔Git pane
+        (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
+            let win = app.win_mut();
+            win.focused = match win.focused { Pane::Claude => Pane::Git, Pane::Git => Pane::Claude };
+            return;
+        }
+        // Window cycling (Ctrl+N / Ctrl+P)
+        (KeyCode::Char('n'), KeyModifiers::CONTROL) => { app.next_window(); return; }
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => { app.prev_window(); return; }
+        // Close current window
+        (KeyCode::Char('x'), KeyModifiers::CONTROL) => {
+            let idx = app.active;
+            app.close_window(idx);
+            return;
+        }
+        _ => {}
+    }
+
+    match app.win().focused {
         Pane::Claude => {
-            if let Some(ref mut s) = app.claude {
+            if let Some(ref mut s) = app.win_mut().claude {
                 let bytes = key_to_bytes(&key);
-                if !bytes.is_empty() {
-                    let _ = s.writer.write_all(&bytes);
-                }
+                if !bytes.is_empty() { let _ = s.writer.write_all(&bytes); }
             }
         }
         Pane::Git => handle_git_key(app, key),
@@ -371,19 +526,60 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 fn handle_git_key(app: &mut App, key: KeyEvent) {
     use KeyCode::*;
     use KeyModifiers as KM;
+
+    // Operations that need &mut App (window management)
+    if app.win().git_tab == GitTab::Worktrees {
+        match (key.code, key.modifiers) {
+            (Enter, _) => {
+                let path = app.win().git_worktrees.get(app.win().worktree_selected).map(|wt| wt.path.clone());
+                if let Some(p) = path { app.open_window(p); }
+                return;
+            }
+            (Char('t'), KM::CONTROL) => {
+                app.input_mode = Some(InputMode::NewWorktree);
+                app.input_buf.clear();
+                return;
+            }
+            (Char('d'), KM::NONE) => {
+                let sel = app.win().worktree_selected;
+                if let Some(wt) = app.win().git_worktrees.get(sel) {
+                    // Don't allow deleting the main worktree (same path as current window's repo root)
+                    if wt.path != app.win().path {
+                        app.input_mode = Some(InputMode::ConfirmDelete(wt.path.clone(), wt.name.clone()));
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match (key.code, key.modifiers) {
-        (Char('c'), KM::CONTROL) | (Char('q'), _) => app.should_quit = true,
-        (Char('f'), KM::CONTROL) => { app.fullscreen = !app.fullscreen; app.diff_content_scroll = 0; }
-        (Char('r'), KM::CONTROL) => app.refresh(),
-        (Char('e'), KM::NONE) if app.git_tab == GitTab::Diff => app.diff_show_list = !app.diff_show_list,
-        (Right, _) => app.git_tab = app.git_tab.next(),
-        (Left, _)  => app.git_tab = app.git_tab.prev(),
-        (Up, _) if app.git_tab == GitTab::Diff && app.diff_show_list => app.diff_select_prev(),
-        (Down, _) if app.git_tab == GitTab::Diff && app.diff_show_list => app.diff_select_next(),
-        (Up, _)       => app.scroll_up(1),
-        (Down, _)     => app.scroll_down(1),
-        (Char('k'), KM::NONE) => app.scroll_up(20),
-        (Char('j'), KM::NONE) => app.scroll_down(20),
+        (Char('c'), KM::CONTROL) | (Char('q'), KM::NONE) => app.should_quit = true,
+        _ => {}
+    }
+    let win = app.win_mut();
+    match (key.code, key.modifiers) {
+        (Char('f'), KM::CONTROL) => { win.fullscreen = !win.fullscreen; win.diff_content_scroll = 0; }
+        (Char('r'), KM::CONTROL) => win.refresh(),
+        (Char('e'), KM::NONE) if win.git_tab == GitTab::Diff => win.diff_show_list = !win.diff_show_list,
+        (Right, _) => win.git_tab = win.git_tab.next(),
+        (Left,  _) => win.git_tab = win.git_tab.prev(),
+        // Worktrees tab navigation
+        (Up, _) if win.git_tab == GitTab::Worktrees => {
+            win.worktree_selected = win.worktree_selected.saturating_sub(1);
+        }
+        (Down, _) if win.git_tab == GitTab::Worktrees => {
+            let max = win.git_worktrees.len().saturating_sub(1);
+            win.worktree_selected = (win.worktree_selected + 1).min(max);
+        }
+        // Diff tab navigation
+        (Up, _) if win.git_tab == GitTab::Diff && win.diff_show_list => win.diff_select_prev(),
+        (Down, _) if win.git_tab == GitTab::Diff && win.diff_show_list => win.diff_select_next(),
+        (Up, _)   => win.scroll_up(1),
+        (Down, _) => win.scroll_down(1),
+        (Char('k'), KM::NONE) => win.scroll_up(20),
+        (Char('j'), KM::NONE) => win.scroll_down(20),
         _ => {}
     }
 }
@@ -397,42 +593,25 @@ fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {
                 let b = (c as u8).to_ascii_uppercase();
                 vec![if b >= b'A' && b <= b'Z' { b - b'A' + 1 } else { c as u8 & 0x1F }]
             } else if key.modifiers.contains(KM::ALT) {
-                let mut v = vec![0x1B];
-                let mut tmp = [0u8; 4];
-                v.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
-                v
+                let mut v = vec![0x1B]; let mut tmp = [0u8; 4];
+                v.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes()); v
             } else {
-                let mut tmp = [0u8; 4];
-                c.encode_utf8(&mut tmp).as_bytes().to_vec()
+                let mut tmp = [0u8; 4]; c.encode_utf8(&mut tmp).as_bytes().to_vec()
             }
         }
-        Enter     => vec![b'\r'],
-        Backspace => vec![0x7F],
-        Delete    => vec![0x1B, b'[', b'3', b'~'],
-        Esc       => vec![0x1B],
-        Tab       => vec![b'\t'],
-        BackTab   => vec![0x1B, b'[', b'Z'],
-        Up        => vec![0x1B, b'[', b'A'],
-        Down      => vec![0x1B, b'[', b'B'],
-        Right     => vec![0x1B, b'[', b'C'],
-        Left      => vec![0x1B, b'[', b'D'],
-        Home      => vec![0x1B, b'[', b'H'],
-        End       => vec![0x1B, b'[', b'F'],
-        PageUp    => vec![0x1B, b'[', b'5', b'~'],
-        PageDown  => vec![0x1B, b'[', b'6', b'~'],
-        Insert    => vec![0x1B, b'[', b'2', b'~'],
-        F(1)  => vec![0x1B, b'O', b'P'],
-        F(2)  => vec![0x1B, b'O', b'Q'],
-        F(3)  => vec![0x1B, b'O', b'R'],
-        F(4)  => vec![0x1B, b'O', b'S'],
-        F(5)  => vec![0x1B, b'[', b'1', b'5', b'~'],
-        F(6)  => vec![0x1B, b'[', b'1', b'7', b'~'],
-        F(7)  => vec![0x1B, b'[', b'1', b'8', b'~'],
-        F(8)  => vec![0x1B, b'[', b'1', b'9', b'~'],
-        F(9)  => vec![0x1B, b'[', b'2', b'0', b'~'],
-        F(10) => vec![0x1B, b'[', b'2', b'1', b'~'],
-        F(11) => vec![0x1B, b'[', b'2', b'3', b'~'],
-        F(12) => vec![0x1B, b'[', b'2', b'4', b'~'],
+        Enter => vec![b'\r'], Backspace => vec![0x7F], Delete => vec![0x1B, b'[', b'3', b'~'],
+        Esc => vec![0x1B], Tab => vec![b'\t'], BackTab => vec![0x1B, b'[', b'Z'],
+        Up => vec![0x1B, b'[', b'A'], Down => vec![0x1B, b'[', b'B'],
+        Right => vec![0x1B, b'[', b'C'], Left => vec![0x1B, b'[', b'D'],
+        Home => vec![0x1B, b'[', b'H'], End => vec![0x1B, b'[', b'F'],
+        PageUp => vec![0x1B, b'[', b'5', b'~'], PageDown => vec![0x1B, b'[', b'6', b'~'],
+        Insert => vec![0x1B, b'[', b'2', b'~'],
+        F(1) => vec![0x1B, b'O', b'P'], F(2) => vec![0x1B, b'O', b'Q'],
+        F(3) => vec![0x1B, b'O', b'R'], F(4) => vec![0x1B, b'O', b'S'],
+        F(5) => vec![0x1B, b'[', b'1', b'5', b'~'], F(6) => vec![0x1B, b'[', b'1', b'7', b'~'],
+        F(7) => vec![0x1B, b'[', b'1', b'8', b'~'], F(8) => vec![0x1B, b'[', b'1', b'9', b'~'],
+        F(9) => vec![0x1B, b'[', b'2', b'0', b'~'], F(10) => vec![0x1B, b'[', b'2', b'1', b'~'],
+        F(11) => vec![0x1B, b'[', b'2', b'3', b'~'], F(12) => vec![0x1B, b'[', b'2', b'4', b'~'],
         _ => vec![],
     }
 }
@@ -440,38 +619,104 @@ fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {
 // ── Rendering ─────────────────────────────────────────────────────────────
 
 fn render(app: &App, frame: &mut Frame) {
+    let [winbar_area, content_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(frame.area());
+
+    render_window_bar(app, frame, winbar_area);
+
+    let win = app.win();
     let normal = Style::default().fg(Color::Blue);
     let active = Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD);
 
-    if app.fullscreen {
-        let area = frame.area();
-        match app.focused {
-            Pane::Claude => render_claude_pane(app, frame, area, true, normal, active),
-            Pane::Git    => render_git_pane(app, frame, area, true, normal, active),
+    if win.fullscreen {
+        match win.focused {
+            Pane::Claude => render_claude_pane(win, frame, content_area, true, normal, active),
+            Pane::Git    => render_git_pane(win, frame, content_area, true, normal, active, &app.open_paths()),
         }
         return;
     }
 
     let [left, right] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .areas(frame.area());
-    render_claude_pane(app, frame, left,  app.focused == Pane::Claude, normal, active);
-    render_git_pane(app, frame, right, app.focused == Pane::Git,    normal, active);
+        .areas(content_area);
+    render_claude_pane(win, frame, left,  win.focused == Pane::Claude, normal, active);
+    render_git_pane(win, frame, right, win.focused == Pane::Git, normal, active, &app.open_paths());
+
+    if app.input_mode.is_some() {
+        render_input_prompt(app, frame);
+    }
+}
+
+fn render_window_bar(app: &App, frame: &mut Frame, area: Rect) {
+    let names: Vec<String> = app.windows.iter().map(|w| format!(" {} ", w.name)).collect();
+    let tabs = Tabs::new(names)
+        .select(app.active)
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
+        .divider("│");
+    frame.render_widget(tabs, area);
+}
+
+fn render_input_prompt(app: &App, frame: &mut Frame) {
+    let area = frame.area();
+    let w = 54u16.min(area.width.saturating_sub(4));
+    let h = 5u16;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let dialog = Rect { x, y, width: w, height: h };
+
+    frame.render_widget(ratatui::widgets::Clear, dialog);
+
+    match &app.input_mode {
+        Some(InputMode::NewWorktree) => {
+            let block = Block::bordered()
+                .border_style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
+                .title(" New Worktree ");
+            let inner = block.inner(dialog);
+            frame.render_widget(block, dialog);
+            let [label_area, input_area] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+            frame.render_widget(Paragraph::new("Branch name (worktree created at ../name):"), label_area);
+            frame.render_widget(
+                Paragraph::new(format!("{}_", app.input_buf))
+                    .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                input_area,
+            );
+        }
+        Some(InputMode::ConfirmDelete(_, name)) => {
+            let block = Block::bordered()
+                .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                .title(" Delete Worktree ");
+            let inner = block.inner(dialog);
+            frame.render_widget(block, dialog);
+            let [label_area, confirm_area] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+            frame.render_widget(
+                Paragraph::new(format!("Remove worktree '{name}'?")),
+                label_area,
+            );
+            frame.render_widget(
+                Paragraph::new("Press y to confirm, n or Esc to cancel")
+                    .style(Style::default().fg(Color::DarkGray)),
+                confirm_area,
+            );
+        }
+        None => {}
+    }
 }
 
 // ── Claude pane ───────────────────────────────────────────────────────────
 
-fn render_claude_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool, normal: Style, active: Style) {
+fn render_claude_pane(win: &Window, frame: &mut Frame, area: Rect, focused: bool, normal: Style, active: Style) {
     let border_style = if focused { active } else { normal };
-    let hint = if focused { " ^W switch pane  ^Q quit " } else { "" };
+    let hint = if focused { " ^W pane  ^W→Git  ^]close  ^Q quit " } else { "" };
+    let title = if focused { format!(" {} * ", win.name) } else { format!(" {} ", win.name) };
 
     let block = Block::bordered()
         .border_style(border_style)
-        .title(if focused { " Claude Code * " } else { " Claude Code " })
+        .title(title)
         .title_bottom(Line::from(hint).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let Some(ref session) = app.claude else {
+    let Some(ref session) = win.claude else {
         frame.render_widget(
             Paragraph::new("Failed to start claude CLI.\nEnsure `claude` is on PATH.")
                 .style(Style::default().fg(Color::Red)),
@@ -488,35 +733,27 @@ fn render_claude_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool, n
         let mut spans: Vec<Span> = Vec::new();
         let mut run_text = String::new();
         let mut run_style = Style::default();
-
         for col in 0..screen_cols {
             let (text, style) = match screen.cell(row, col) {
                 None => (" ".to_string(), Style::default()),
                 Some(cell) => {
                     let c = cell.contents();
-                    let t = if c.is_empty() { " ".to_string() } else { c };
-                    (t, cell_to_style(cell))
+                    (if c.is_empty() { " ".to_string() } else { c }, cell_to_style(cell))
                 }
             };
             if style == run_style {
                 run_text.push_str(&text);
             } else {
-                if !run_text.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut run_text), run_style));
-                }
-                run_text = text;
-                run_style = style;
+                if !run_text.is_empty() { spans.push(Span::styled(std::mem::take(&mut run_text), run_style)); }
+                run_text = text; run_style = style;
             }
         }
-        if !run_text.is_empty() {
-            spans.push(Span::styled(run_text, run_style));
-        }
+        if !run_text.is_empty() { spans.push(Span::styled(run_text, run_style)); }
         Line::from(spans)
     }).collect();
 
     frame.render_widget(Paragraph::new(lines), inner);
 
-    // Show cursor
     if focused {
         let (crow, ccol) = screen.cursor_position();
         let cx = inner.x.saturating_add(ccol);
@@ -542,15 +779,12 @@ fn vt100_color(c: vt100::Color) -> Option<Color> {
     match c {
         vt100::Color::Default => None,
         vt100::Color::Idx(i) => Some(match i {
-            0 => Color::Black,        1 => Color::Red,
-            2 => Color::Green,        3 => Color::Yellow,
-            4 => Color::Blue,         5 => Color::Magenta,
-            6 => Color::Cyan,         7 => Color::White,
-            8 => Color::DarkGray,     9 => Color::LightRed,
-            10 => Color::LightGreen,  11 => Color::LightYellow,
-            12 => Color::LightBlue,   13 => Color::LightMagenta,
-            14 => Color::LightCyan,   15 => Color::Gray,
-            n => Color::Indexed(n),
+            0 => Color::Black,       1 => Color::Red,         2 => Color::Green,
+            3 => Color::Yellow,      4 => Color::Blue,        5 => Color::Magenta,
+            6 => Color::Cyan,        7 => Color::White,       8 => Color::DarkGray,
+            9 => Color::LightRed,   10 => Color::LightGreen, 11 => Color::LightYellow,
+            12 => Color::LightBlue, 13 => Color::LightMagenta, 14 => Color::LightCyan,
+            15 => Color::Gray,       n => Color::Indexed(n),
         }),
         vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
     }
@@ -558,13 +792,14 @@ fn vt100_color(c: vt100::Color) -> Option<Color> {
 
 // ── Git pane ──────────────────────────────────────────────────────────────
 
-fn render_git_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool, normal: Style, active: Style) {
+fn render_git_pane(win: &Window, frame: &mut Frame, area: Rect, focused: bool, normal: Style, active: Style, open_paths: &HashSet<PathBuf>) {
     let border_style = if focused { active } else { normal };
     let hint = if focused {
-        match (app.git_tab, app.fullscreen) {
-            (GitTab::Diff, true)  => " ↑↓/j/k scroll  e explorer  ^F exit fullscreen  ^R refresh ",
-            (GitTab::Diff, false) => " ←→ tabs  ↑↓ file  j/k scroll  e explorer  ^F fullscreen  ^R refresh ",
-            _                    => " ←→ tabs  ↑↓ scroll  ^R refresh ",
+        match (win.git_tab, win.fullscreen) {
+            (GitTab::Diff, true)      => " ↑↓/j/k scroll  e explorer  ^F exit fullscreen  ^R refresh ",
+            (GitTab::Diff, false)     => " ←→ tabs  ↑↓ file  j/k scroll  e explorer  ^F fullscreen  ^R refresh ",
+            (GitTab::Worktrees, _)    => " ←→ tabs  ↑↓ select  Enter open  ^T new  d delete  ^R refresh ",
+            _                        => " ←→ tabs  ↑↓ scroll  ^R refresh ",
         }
     } else { "" };
 
@@ -575,51 +810,73 @@ fn render_git_pane(app: &App, frame: &mut Frame, area: Rect, focused: bool, norm
     frame.render_widget(block, area);
 
     let [tabs_area, sep_area, content_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
-            .areas(inner);
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)]).areas(inner);
 
     let tab_style = if focused { Style::default().fg(Color::Blue) } else { Style::default().fg(Color::DarkGray) };
     let tabs = Tabs::new(GitTab::ALL.iter().map(|t| t.title()).collect::<Vec<_>>())
-        .select(app.git_tab.index())
+        .select(win.git_tab.index())
         .style(tab_style)
         .highlight_style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD | Modifier::UNDERLINED))
         .divider("│");
     frame.render_widget(tabs, tabs_area);
     frame.render_widget(Block::default().borders(Borders::TOP).border_style(border_style), sep_area);
 
-    if app.git_tab == GitTab::Diff {
-        render_diff_tab(app, frame, content_area, focused, border_style);
-    } else {
-        render_scrollable_text(app.simple_tab_content(), app.current_scroll(), frame, content_area, border_style);
+    match win.git_tab {
+        GitTab::Diff => render_diff_tab(win, frame, content_area, focused, border_style),
+        GitTab::Worktrees => render_worktrees_tab(win, frame, content_area, border_style, open_paths),
+        _ => render_scrollable_text(win.simple_tab_content(), win.current_scroll(), frame, content_area, border_style),
     }
 }
 
-fn render_diff_tab(app: &App, frame: &mut Frame, area: Rect, focused: bool, border_style: Style) {
-    if app.file_diffs.is_empty() {
+fn render_worktrees_tab(win: &Window, frame: &mut Frame, area: Rect, _border_style: Style, open_paths: &HashSet<PathBuf>) {
+    if win.git_worktrees.is_empty() {
+        frame.render_widget(Paragraph::new("No worktrees found."), area);
+        return;
+    }
+
+    let items: Vec<ListItem> = win.git_worktrees.iter().map(|wt| {
+        let is_open = open_paths.contains(&wt.path);
+        let label = if is_open {
+            format!("{} [open]", wt.name)
+        } else {
+            wt.name.clone()
+        };
+        ListItem::new(label)
+    }).collect();
+
+    let list = List::new(items)
+        .highlight_style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD | Modifier::REVERSED))
+        .highlight_symbol("▶ ");
+    let mut state = ListState::default().with_selected(Some(win.worktree_selected));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_diff_tab(win: &Window, frame: &mut Frame, area: Rect, focused: bool, border_style: Style) {
+    if win.file_diffs.is_empty() {
         frame.render_widget(Paragraph::new(if focused { "No changes in working tree." } else { "" }), area);
         return;
     }
 
-    let diff_area = if app.diff_show_list {
+    let diff_area = if win.diff_show_list {
         let [list_area, div_area, content_area] = Layout::horizontal([
             Constraint::Percentage(20), Constraint::Length(1), Constraint::Min(0),
         ]).areas(area);
 
-        let items: Vec<ListItem> = app.file_diffs.iter().map(|f| ListItem::new(f.filename.as_str())).collect();
+        let items: Vec<ListItem> = win.file_diffs.iter().map(|f| ListItem::new(f.filename.as_str())).collect();
         let list = List::new(items)
             .highlight_style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD | Modifier::REVERSED))
             .highlight_symbol("▶ ");
-        let mut list_state = ListState::default().with_selected(Some(app.diff_file_idx));
+        let mut list_state = ListState::default().with_selected(Some(win.diff_file_idx));
         frame.render_stateful_widget(list, list_area, &mut list_state);
         frame.render_widget(Block::default().borders(Borders::LEFT).border_style(border_style), div_area);
         content_area
     } else { area };
 
-    if let Some(fd) = app.file_diffs.get(app.diff_file_idx) {
-        if app.fullscreen {
-            render_sbs(fd, app.diff_content_scroll, frame, diff_area, border_style);
+    if let Some(fd) = win.file_diffs.get(win.diff_file_idx) {
+        if win.fullscreen {
+            render_sbs(fd, win.diff_content_scroll, frame, diff_area, border_style);
         } else {
-            render_unified_diff(&fd.content, app.diff_content_scroll, frame, diff_area, border_style);
+            render_unified_diff(&fd.content, win.diff_content_scroll, frame, diff_area, border_style);
         }
     }
 }
@@ -649,15 +906,13 @@ fn render_sbs(fd: &FileDiff, scroll: u16, frame: &mut Frame, area: Rect, border_
     let height = left_area.height as usize;
     let start = scroll as usize;
     let end = (start + height).min(total);
-
-    let (mut left_lines, mut right_lines) = (Vec::with_capacity(height), Vec::with_capacity(height));
+    let (mut ll, mut rl) = (Vec::with_capacity(height), Vec::with_capacity(height));
     for row in rows.get(start..end).unwrap_or(&[]) {
         let (l, r) = sbs_row_to_lines(row, no_w);
-        left_lines.push(l); right_lines.push(r);
+        ll.push(l); rl.push(r);
     }
-
-    frame.render_widget(Paragraph::new(left_lines), left_area);
-    frame.render_widget(Paragraph::new(right_lines), right_area);
+    frame.render_widget(Paragraph::new(ll), left_area);
+    frame.render_widget(Paragraph::new(rl), right_area);
 
     let mut sb = ScrollbarState::new(total.saturating_sub(height)).position(scroll as usize);
     frame.render_stateful_widget(Scrollbar::new(ScrollbarOrientation::VerticalRight).style(border_style), sb_area, &mut sb);
@@ -665,28 +920,27 @@ fn render_sbs(fd: &FileDiff, scroll: u16, frame: &mut Frame, area: Rect, border_
 
 fn sbs_row_to_lines(row: &SbsRow, no_w: usize) -> (Line<'static>, Line<'static>) {
     let no_s = Style::default().fg(Color::DarkGray);
-    let fmt_no = |n: Option<usize>| format!("{:>no_w$} ", n.map(|v| v.to_string()).unwrap_or_default());
-
+    let fmt = |n: Option<usize>| format!("{:>no_w$} ", n.map(|v| v.to_string()).unwrap_or_default());
     match row.kind {
         SbsKind::Header => {
             let s = Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD);
             (Line::from(Span::styled(row.left.clone(), s)), Line::from(Span::styled(row.right.clone(), s)))
         }
         SbsKind::Context => (
-            Line::from(vec![Span::styled(fmt_no(row.left_no), no_s),  Span::raw(row.left.clone())]),
-            Line::from(vec![Span::styled(fmt_no(row.right_no), no_s), Span::raw(row.right.clone())]),
+            Line::from(vec![Span::styled(fmt(row.left_no), no_s),  Span::raw(row.left.clone())]),
+            Line::from(vec![Span::styled(fmt(row.right_no), no_s), Span::raw(row.right.clone())]),
         ),
         SbsKind::Removed => (
-            Line::from(vec![Span::styled(fmt_no(row.left_no), no_s), Span::styled(row.left.clone(), Style::default().fg(Color::Red))]),
+            Line::from(vec![Span::styled(fmt(row.left_no), no_s), Span::styled(row.left.clone(), Style::default().fg(Color::Red))]),
             Line::from(Span::raw("")),
         ),
         SbsKind::Added => (
             Line::from(Span::raw("")),
-            Line::from(vec![Span::styled(fmt_no(row.right_no), no_s), Span::styled(row.right.clone(), Style::default().fg(Color::Green))]),
+            Line::from(vec![Span::styled(fmt(row.right_no), no_s), Span::styled(row.right.clone(), Style::default().fg(Color::Green))]),
         ),
         SbsKind::Changed => (
-            Line::from(vec![Span::styled(fmt_no(row.left_no), no_s),  Span::styled(row.left.clone(),  Style::default().fg(Color::Red))]),
-            Line::from(vec![Span::styled(fmt_no(row.right_no), no_s), Span::styled(row.right.clone(), Style::default().fg(Color::Green))]),
+            Line::from(vec![Span::styled(fmt(row.left_no),  no_s), Span::styled(row.left.clone(),  Style::default().fg(Color::Red))]),
+            Line::from(vec![Span::styled(fmt(row.right_no), no_s), Span::styled(row.right.clone(), Style::default().fg(Color::Green))]),
         ),
     }
 }
@@ -707,4 +961,3 @@ fn color_diff_line(line: &str) -> Line<'_> {
         else { Style::default() };
     Line::from(Span::styled(line, style))
 }
-
