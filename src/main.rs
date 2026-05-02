@@ -105,6 +105,27 @@ fn parse_worktrees(raw: &str) -> Vec<Worktree> {
         .collect()
 }
 
+// ── Branch parsing ───────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct Branch {
+    name: String,
+    is_current: bool,
+}
+
+fn parse_branches(raw: &str) -> Vec<Branch> {
+    raw.lines()
+        .filter(|l| { let t = l.trim(); !t.is_empty() && !t.contains("remotes/") })
+        .filter_map(|line| {
+            let is_current = line.starts_with("* ");
+            let rest = line.strip_prefix("* ").or_else(|| line.strip_prefix("  "))?;
+            let name = rest.split_whitespace().next()?.to_string();
+            if name.is_empty() { return None; }
+            Some(Branch { name, is_current })
+        })
+        .collect()
+}
+
 // ── Diff parsing ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -205,7 +226,8 @@ struct Window {
     git_log: String,
     git_worktrees: Vec<Worktree>,
     worktree_selected: usize,
-    git_branches: String,
+    git_branches: Vec<Branch>,
+    branch_selected: usize,
 }
 
 impl Window {
@@ -225,7 +247,8 @@ impl Window {
             git_log: String::new(),
             git_worktrees: Vec::new(),
             worktree_selected: 0,
-            git_branches: String::new(),
+            git_branches: Vec::new(),
+            branch_selected: 0,
         };
         win.refresh();
         win
@@ -234,7 +257,8 @@ impl Window {
     fn refresh(&mut self) {
         self.git_log = run_in(&self.path, "git", &["log", "--oneline", "--graph", "--decorate", "--color=never", "-100"]);
         self.git_worktrees = parse_worktrees(&run_in(&self.path, "git", &["worktree", "list", "--porcelain"]));
-        self.git_branches = run_in(&self.path, "git", &["branch", "-a", "-vv"]);
+        self.git_branches = parse_branches(&run_in(&self.path, "git", &["branch", "-a", "-vv"]));
+        self.branch_selected = self.branch_selected.min(self.git_branches.len().saturating_sub(1));
         self.file_diffs = parse_diff(&run_in(&self.path, "git", &["diff"]));
         self.scroll_offsets = [0; 4];
         self.diff_file_idx = 0;
@@ -253,8 +277,7 @@ impl Window {
     fn simple_tab_content(&self) -> &str {
         match self.git_tab {
             GitTab::Log => &self.git_log,
-            GitTab::Branches => &self.git_branches,
-            GitTab::Diff | GitTab::Worktrees => "",
+            _ => "",
         }
     }
 
@@ -302,7 +325,7 @@ impl Window {
 
 // ── App ───────────────────────────────────────────────────────────────────
 
-enum InputMode { NewWorktree, ConfirmDelete(PathBuf, String) }
+enum InputMode { NewWorktree, ConfirmDelete(PathBuf, String), ConfirmDeleteBranch(String) }
 
 struct App {
     windows: Vec<Window>,
@@ -358,6 +381,12 @@ impl App {
             .args(["worktree", "remove", "--force", path.to_str().unwrap_or(name)])
             .current_dir(&base)
             .output();
+        self.win_mut().refresh();
+    }
+
+    fn delete_branch(&mut self, name: &str) {
+        let base = self.win().path.clone();
+        let _ = Command::new("git").args(["branch", "-d", name]).current_dir(&base).output();
         self.win_mut().refresh();
     }
 
@@ -470,14 +499,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                         app.input_buf.clear();
                         if !name.is_empty() { app.create_worktree(&name); }
                     }
-                    Some(InputMode::ConfirmDelete(_, _)) => { app.input_buf.clear(); }
+                    Some(InputMode::ConfirmDelete(_, _)) | Some(InputMode::ConfirmDeleteBranch(_)) => { app.input_buf.clear(); }
                     None => {}
                 }
             }
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(InputMode::ConfirmDelete(path, name)) = app.input_mode.take() {
-                    app.input_buf.clear();
-                    app.delete_worktree(&path, &name);
+                match app.input_mode.take() {
+                    Some(InputMode::ConfirmDelete(path, name)) => {
+                        app.input_buf.clear();
+                        app.delete_worktree(&path, &name);
+                    }
+                    Some(InputMode::ConfirmDeleteBranch(name)) => {
+                        app.input_buf.clear();
+                        app.delete_branch(&name);
+                    }
+                    _ => {}
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') => { app.input_mode = None; app.input_buf.clear(); }
@@ -554,6 +590,18 @@ fn handle_git_key(app: &mut App, key: KeyEvent) {
         }
     }
 
+    if app.win().git_tab == GitTab::Branches {
+        if let (Char('d'), KM::NONE) = (key.code, key.modifiers) {
+            let sel = app.win().branch_selected;
+            if let Some(branch) = app.win().git_branches.get(sel) {
+                if !branch.is_current {
+                    app.input_mode = Some(InputMode::ConfirmDeleteBranch(branch.name.clone()));
+                }
+            }
+            return;
+        }
+    }
+
     match (key.code, key.modifiers) {
         (Char('c'), KM::CONTROL) | (Char('q'), KM::NONE) => app.should_quit = true,
         _ => {}
@@ -572,6 +620,14 @@ fn handle_git_key(app: &mut App, key: KeyEvent) {
         (Down, _) if win.git_tab == GitTab::Worktrees => {
             let max = win.git_worktrees.len().saturating_sub(1);
             win.worktree_selected = (win.worktree_selected + 1).min(max);
+        }
+        // Branches tab navigation
+        (Up, _) if win.git_tab == GitTab::Branches => {
+            win.branch_selected = win.branch_selected.saturating_sub(1);
+        }
+        (Down, _) if win.git_tab == GitTab::Branches => {
+            let max = win.git_branches.len().saturating_sub(1);
+            win.branch_selected = (win.branch_selected + 1).min(max);
         }
         // Diff tab navigation
         (Up, _) if win.git_tab == GitTab::Diff && win.diff_show_list => win.diff_select_prev(),
@@ -703,6 +759,20 @@ fn render_input_prompt(app: &App, frame: &mut Frame) {
                 confirm_area,
             );
         }
+        Some(InputMode::ConfirmDeleteBranch(name)) => {
+            let block = Block::bordered()
+                .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                .title(" Delete Branch ");
+            let inner = block.inner(dialog);
+            frame.render_widget(block, dialog);
+            let [label_area, confirm_area] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+            frame.render_widget(Paragraph::new(format!("Delete branch '{name}'?")), label_area);
+            frame.render_widget(
+                Paragraph::new("Press y to confirm, n or Esc to cancel")
+                    .style(Style::default().fg(Color::DarkGray)),
+                confirm_area,
+            );
+        }
         None => {}
     }
 }
@@ -804,6 +874,7 @@ fn render_git_pane(win: &Window, frame: &mut Frame, area: Rect, focused: bool, n
             (GitTab::Diff, true)      => " ↑↓/j/k scroll  e explorer  ^F exit fullscreen  ^R refresh ",
             (GitTab::Diff, false)     => " ←→ tabs  ↑↓ file  j/k scroll  e explorer  ^F fullscreen  ^R refresh ",
             (GitTab::Worktrees, _)    => " ←→ tabs  ↑↓ select  Enter open  ^T new  d delete  ^R refresh ",
+            (GitTab::Branches, _)    => " ←→ tabs  ↑↓ select  d delete  ^R refresh ",
             _                        => " ←→ tabs  ↑↓ scroll  ^R refresh ",
         }
     } else { "" };
@@ -827,9 +898,10 @@ fn render_git_pane(win: &Window, frame: &mut Frame, area: Rect, focused: bool, n
     frame.render_widget(Block::default().borders(Borders::TOP).border_style(border_style), sep_area);
 
     match win.git_tab {
-        GitTab::Diff => render_diff_tab(win, frame, content_area, focused, border_style),
+        GitTab::Diff      => render_diff_tab(win, frame, content_area, focused, border_style),
         GitTab::Worktrees => render_worktrees_tab(win, frame, content_area, border_style, open_paths),
-        _ => render_scrollable_text(win.simple_tab_content(), win.current_scroll(), frame, content_area, border_style),
+        GitTab::Branches  => render_branches_tab(win, frame, content_area),
+        GitTab::Log       => render_scrollable_text(win.simple_tab_content(), win.current_scroll(), frame, content_area, border_style),
     }
 }
 
@@ -853,6 +925,27 @@ fn render_worktrees_tab(win: &Window, frame: &mut Frame, area: Rect, _border_sty
         .highlight_style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD | Modifier::REVERSED))
         .highlight_symbol("▶ ");
     let mut state = ListState::default().with_selected(Some(win.worktree_selected));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_branches_tab(win: &Window, frame: &mut Frame, area: Rect) {
+    if win.git_branches.is_empty() {
+        frame.render_widget(Paragraph::new("No branches found."), area);
+        return;
+    }
+    let items: Vec<ListItem> = win.git_branches.iter().map(|b| {
+        let marker = if b.is_current { "* " } else { "  " };
+        let style = if b.is_current {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        ListItem::new(format!("{}{}", marker, b.name)).style(style)
+    }).collect();
+    let list = List::new(items)
+        .highlight_style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD | Modifier::REVERSED))
+        .highlight_symbol("▶ ");
+    let mut state = ListState::default().with_selected(Some(win.branch_selected));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
