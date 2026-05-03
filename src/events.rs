@@ -101,19 +101,29 @@ fn handle_input_mode(app: &mut App, key: KeyEvent) {
             }
             None => {}
         },
-        KeyCode::Char('y') | KeyCode::Char('Y') => match app.input_mode.take() {
-            Some(InputMode::ConfirmDelete(path, name)) => {
-                app.input_buf.clear();
-                app.delete_worktree(&path, &name);
+        KeyCode::Char(c @ 'y') | KeyCode::Char(c @ 'Y') => {
+            if matches!(app.input_mode, Some(InputMode::NewWorktree))
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                app.input_buf.push(c);
+            } else {
+                match app.input_mode.take() {
+                    Some(InputMode::ConfirmDelete(path, name)) => {
+                        app.input_buf.clear();
+                        app.delete_worktree(&path, &name);
+                    }
+                    Some(InputMode::ConfirmDeleteBranch(name)) => {
+                        app.input_buf.clear();
+                        app.delete_branch(&name);
+                    }
+                    _ => {}
+                }
             }
-            Some(InputMode::ConfirmDeleteBranch(name)) => {
-                app.input_buf.clear();
-                app.delete_branch(&name);
-            }
-            _ => {}
-        },
+        }
         KeyCode::Char(c @ 'n') | KeyCode::Char(c @ 'N') => {
-            if matches!(app.input_mode, Some(InputMode::ConfirmDelete(_, _))) {
+            if matches!(app.input_mode, Some(InputMode::ConfirmDelete(_, _)))
+                || matches!(app.input_mode, Some(InputMode::ConfirmDeleteBranch(_)))
+            {
                 app.input_mode = None;
                 app.input_buf.clear();
             } else if matches!(app.input_mode, Some(InputMode::NewWorktree))
