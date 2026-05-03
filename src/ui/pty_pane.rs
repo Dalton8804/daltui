@@ -16,7 +16,7 @@ pub fn render_claude_pane(
     active: Style,
 ) {
     let border_style = if focused { active } else { normal };
-    let hint = if focused { " ^W pane  ^Q quit " } else { "" };
+    let hint = if focused { " S↑↓/PgUp/PgDn scroll  ^W pane  ^Q quit " } else { "" };
     let title = if focused { format!(" {} * ", win.name) } else { format!(" {} ", win.name) };
     render_pty_pane(
         win.claude.as_ref(),
@@ -27,6 +27,7 @@ pub fn render_claude_pane(
         hint,
         border_style,
         "Failed to start claude CLI.\nEnsure `claude` is on PATH.",
+        win.claude_scroll,
     );
 }
 
@@ -50,6 +51,7 @@ pub fn render_terminal_pane(
         hint,
         border_style,
         "Failed to start shell.\nCheck $SHELL.",
+        0,
     );
 }
 
@@ -62,6 +64,7 @@ fn render_pty_pane(
     hint: &str,
     border_style: Style,
     fail_msg: &str,
+    scroll_offset: usize,
 ) {
     let block = Block::bordered()
         .border_style(border_style)
@@ -78,9 +81,12 @@ fn render_pty_pane(
         return;
     };
 
-    let Ok(parser) = session.parser.lock() else {
+    let Ok(mut parser) = session.parser.lock() else {
         return;
     };
+
+    parser.set_scrollback(scroll_offset);
+
     let screen = parser.screen();
     let (screen_rows, screen_cols) = screen.size();
 
@@ -114,10 +120,18 @@ fn render_pty_pane(
         })
         .collect();
 
+    let cursor = if focused && scroll_offset == 0 {
+        Some(screen.cursor_position())
+    } else {
+        None
+    };
+
+    parser.set_scrollback(0);
+    drop(parser);
+
     frame.render_widget(Paragraph::new(lines), inner);
 
-    if focused {
-        let (crow, ccol) = screen.cursor_position();
+    if let Some((crow, ccol)) = cursor {
         let cx = inner.x.saturating_add(ccol);
         let cy = inner.y.saturating_add(crow);
         if cx < inner.x + inner.width && cy < inner.y + inner.height {
