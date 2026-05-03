@@ -39,6 +39,8 @@ impl KeyBinding {
             format!("^{key}")
         } else if self.modifiers.contains(KeyModifiers::ALT) {
             format!("M-{key}")
+        } else if self.modifiers.contains(KeyModifiers::SHIFT) {
+            format!("S{key}")
         } else {
             key
         }
@@ -170,11 +172,38 @@ impl Default for DiffKeys {
 pub struct PtyKeys {
     pub cycle_pane: KeyBinding,
     pub quit: KeyBinding,
+    pub scroll_up: KeyBinding,
+    pub scroll_down: KeyBinding,
+    pub page_up: KeyBinding,
+    pub page_down: KeyBinding,
+}
+
+fn shift_up() -> KeyBinding {
+    KeyBinding::new(KeyCode::Up, KeyModifiers::SHIFT)
+}
+
+fn shift_down() -> KeyBinding {
+    KeyBinding::new(KeyCode::Down, KeyModifiers::SHIFT)
+}
+
+fn page_up() -> KeyBinding {
+    KeyBinding::new(KeyCode::PageUp, KeyModifiers::NONE)
+}
+
+fn page_down() -> KeyBinding {
+    KeyBinding::new(KeyCode::PageDown, KeyModifiers::NONE)
 }
 
 impl Default for PtyKeys {
     fn default() -> Self {
-        Self { cycle_pane: ctrl('w'), quit: ctrl('q') }
+        Self {
+            cycle_pane: ctrl('w'),
+            quit: ctrl('q'),
+            scroll_up: shift_up(),
+            scroll_down: shift_down(),
+            page_up: page_up(),
+            page_down: page_down(),
+        }
     }
 }
 

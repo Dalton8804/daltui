@@ -8,15 +8,17 @@ use crate::config::KeyConfig;
 pub fn handle_resize(app: &mut App, total_cols: u16, total_rows: u16) {
     let content_rows = total_rows.saturating_sub(1);
     let half_cols = (total_cols / 2).saturating_sub(2);
+    let claude_rows = content_rows.saturating_sub(2);
+    let term_rows = (content_rows * 40 / 100).saturating_sub(2).max(1);
+    app.pty_dims = (half_cols, claude_rows, term_rows);
     for win in &mut app.windows {
         let claude_cols = if win.fullscreen && win.focused == Pane::Claude {
             total_cols.saturating_sub(2)
         } else {
             half_cols
         };
-        win.resize_claude_pty(claude_cols, content_rows.saturating_sub(2));
+        win.resize_claude_pty(claude_cols, claude_rows);
         if !win.fullscreen {
-            let term_rows = (content_rows * 40 / 100).saturating_sub(2).max(1);
             win.resize_terminal_pty(half_cols, term_rows);
         }
     }
@@ -61,6 +63,27 @@ pub fn handle_key(app: &mut App, key: KeyEvent, kc: &KeyConfig) {
 
     match app.win().focused {
         Pane::Claude => {
+            if kc.pty.scroll_up.matches(key.code, key.modifiers) {
+                let clamped = probe_scroll(app, 3);
+                app.win_mut().claude_scroll = clamped;
+                return;
+            }
+            if kc.pty.scroll_down.matches(key.code, key.modifiers) {
+                let s = &mut app.win_mut().claude_scroll;
+                *s = s.saturating_sub(3);
+                return;
+            }
+            if kc.pty.page_up.matches(key.code, key.modifiers) {
+                let clamped = probe_scroll(app, 20);
+                app.win_mut().claude_scroll = clamped;
+                return;
+            }
+            if kc.pty.page_down.matches(key.code, key.modifiers) {
+                let s = &mut app.win_mut().claude_scroll;
+                *s = s.saturating_sub(20);
+                return;
+            }
+            app.win_mut().claude_scroll = 0;
             if let Some(ref mut s) = app.win_mut().claude {
                 let bytes = key_to_bytes(&key);
                 if !bytes.is_empty() {
@@ -243,6 +266,24 @@ fn handle_git_key(app: &mut App, key: KeyEvent, kc: &KeyConfig) {
         (Down, _) => win.scroll_down(1),
         _ => {}
     }
+}
+
+fn probe_scroll(app: &App, step: usize) -> usize {
+    let desired = app.win().claude_scroll.saturating_add(step);
+    app.win()
+        .claude
+        .as_ref()
+        .and_then(|s| s.parser.lock().ok())
+        .map(|mut p| {
+            p.set_scrollback(desired);
+            let actual = p.screen().scrollback();
+            let (screen_rows, _) = p.screen().size();
+            p.set_scrollback(0);
+            // Cap at screen_rows: visible_rows() does `take(rows_len - offset)` which
+            // underflows if offset > rows_len, causing a panic.
+            actual.min(screen_rows as usize)
+        })
+        .unwrap_or(0)
 }
 
 fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {

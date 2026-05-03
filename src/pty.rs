@@ -11,7 +11,7 @@ pub struct PtySession {
     pub master: Box<dyn MasterPty + Send>,
 }
 
-pub fn spawn_pty_session(path: &Path, cmd: &str, args: &[&str], size: PtySize) -> Option<PtySession> {
+pub fn spawn_pty_session(path: &Path, cmd: &str, args: &[&str], size: PtySize, scrollback: usize) -> Option<PtySession> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(size).ok()?;
     let mut builder = CommandBuilder::new(cmd);
@@ -23,7 +23,7 @@ pub fn spawn_pty_session(path: &Path, cmd: &str, args: &[&str], size: PtySize) -
     drop(pair.slave);
     let writer = pair.master.take_writer().ok()?;
     let reader = pair.master.try_clone_reader().ok()?;
-    let parser = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 0)));
+    let parser = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, scrollback)));
     let parser_clone = Arc::clone(&parser);
     std::thread::spawn(move || pty_reader_thread(reader, parser_clone));
     Some(PtySession { parser, writer, child, master: pair.master })

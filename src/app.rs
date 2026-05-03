@@ -71,6 +71,7 @@ pub struct Window {
     pub terminal: Option<PtySession>,
     pub focused: Pane,
     pub git_tab: GitTab,
+    pub claude_scroll: usize,
     pub scroll_offsets: [u16; 4],
     pub file_diffs: Vec<FileDiff>,
     pub diff_file_idx: usize,
@@ -91,6 +92,7 @@ impl Window {
             "claude",
             &[],
             PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 },
+            1000,
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let terminal = spawn_pty_session(
@@ -98,6 +100,7 @@ impl Window {
             &shell,
             &[],
             PtySize { rows: 12, cols: 80, pixel_width: 0, pixel_height: 0 },
+            0,
         );
         let mut win = Self {
             name,
@@ -106,6 +109,7 @@ impl Window {
             terminal,
             focused: Pane::Claude,
             git_tab: GitTab::Diff,
+            claude_scroll: 0,
             scroll_offsets: [0; 4],
             file_diffs: Vec::new(),
             diff_file_idx: 0,
@@ -224,6 +228,7 @@ pub struct App {
     pub should_quit: bool,
     pub input_mode: Option<InputMode>,
     pub input_buf: String,
+    pub pty_dims: (u16, u16, u16), // (half_cols, claude_rows, term_rows)
 }
 
 impl App {
@@ -237,6 +242,7 @@ impl App {
             should_quit: false,
             input_mode: None,
             input_buf: String::new(),
+            pty_dims: (80, 22, 10),
         }
     }
 
@@ -249,6 +255,7 @@ impl App {
         let half_cols = (size.width / 2).saturating_sub(2);
         let claude_rows = content_rows.saturating_sub(2);
         let term_rows = (content_rows * 40 / 100).saturating_sub(2).max(1);
+        app.pty_dims = (half_cols, claude_rows, term_rows);
         for win in &mut app.windows {
             win.resize_claude_pty(half_cols, claude_rows);
             win.resize_terminal_pty(half_cols, term_rows);
@@ -292,6 +299,10 @@ impl App {
         let name = branch_name_for(&path);
         self.windows.push(Window::new(path, name));
         self.active = self.windows.len() - 1;
+        let (half_cols, claude_rows, term_rows) = self.pty_dims;
+        let win = self.windows.last_mut().unwrap();
+        win.resize_claude_pty(half_cols, claude_rows);
+        win.resize_terminal_pty(half_cols, term_rows);
     }
 
     pub fn close_window(&mut self, idx: usize) {
