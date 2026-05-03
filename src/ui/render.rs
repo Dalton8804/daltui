@@ -62,7 +62,7 @@ fn render_window_bar(app: &App, frame: &mut Frame, area: Rect) {
         .divider("│");
     frame.render_widget(tabs, area);
 
-    let title = Paragraph::new("datui")
+    let title = Paragraph::new("daltui")
         .style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
     frame.render_widget(title, area);
