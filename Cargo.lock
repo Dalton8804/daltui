@@ -204,6 +204,8 @@ version = "0.1.0"
 dependencies = [
  "portable-pty",
  "ratatui",
+ "serde",
+ "toml",
  "vt100",
 ]
 
@@ -239,17 +241,6 @@ dependencies = [
  "darling_core",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "daltui"
-version = "0.1.0"
-dependencies = [
- "portable-pty",
- "ratatui",
- "serde",
- "toml",
- "vt100",
 ]
 
 [[package]]

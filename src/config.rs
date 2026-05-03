@@ -219,7 +219,7 @@ pub struct KeyConfig {
 impl KeyConfig {
     pub fn load() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let path = std::path::Path::new(&home).join(".config/datui/config.toml");
+        let path = std::path::Path::new(&home).join(".config/daltui/config.toml");
         std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| toml::from_str(&s).ok())
