@@ -7,3 +7,5 @@ edition = "2024"
 ratatui = "0.30.0"
 portable-pty = "0.8"
 vt100 = "0.15"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
