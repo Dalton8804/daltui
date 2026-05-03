@@ -11,6 +11,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{GitTab, Window};
+use crate::config::KeyConfig;
 use crate::git::{FileDiff, SbsKind, SbsRow};
 
 pub fn render_git_pane(
@@ -21,24 +22,45 @@ pub fn render_git_pane(
     normal: Style,
     active: Style,
     open_paths: &HashSet<PathBuf>,
+    keys: &KeyConfig,
 ) {
     let border_style = if focused { active } else { normal };
     let hint = if focused {
+        let g = &keys.git;
+        let d = &keys.diff;
         match (win.git_tab, win.fullscreen) {
-            (GitTab::Diff, true) => {
-                " ↑↓/j/k scroll  e explorer  ^F exit fullscreen  ^R refresh "
-            }
-            (GitTab::Diff, false) => {
-                " ←→ tabs  ↑↓ file  j/k scroll  e explorer  ^F fullscreen  ^R refresh "
-            }
-            (GitTab::Worktrees, _) => {
-                " ←→ tabs  ↑↓ select  Enter open  ^T new  d delete  ^R refresh "
-            }
-            (GitTab::Branches, _) => " ←→ tabs  ↑↓ select  d delete  ^R refresh ",
-            _ => " ←→ tabs  ↑↓ scroll  ^R refresh ",
+            (GitTab::Diff, true) => format!(
+                " ↑↓/{}/{} scroll  {} explorer  {} exit fullscreen  {} refresh ",
+                d.scroll_down.display(),
+                d.scroll_up.display(),
+                d.explorer.display(),
+                d.fullscreen.display(),
+                g.refresh.display(),
+            ),
+            (GitTab::Diff, false) => format!(
+                " ←→ tabs  ↑↓ file  {}/{} scroll  {} explorer  {} fullscreen  {} refresh ",
+                d.scroll_down.display(),
+                d.scroll_up.display(),
+                d.explorer.display(),
+                d.fullscreen.display(),
+                g.refresh.display(),
+            ),
+            (GitTab::Worktrees, _) => format!(
+                " ←→ tabs  ↑↓ select  {} open  {} new  {} delete  {} refresh ",
+                g.open.display(),
+                g.new_worktree.display(),
+                g.delete.display(),
+                g.refresh.display(),
+            ),
+            (GitTab::Branches, _) => format!(
+                " ←→ tabs  ↑↓ select  {} delete  {} refresh ",
+                g.delete.display(),
+                g.refresh.display(),
+            ),
+            _ => format!(" ←→ tabs  ↑↓ scroll  {} refresh ", g.refresh.display()),
         }
     } else {
-        ""
+        String::new()
     };
 
     let block = Block::bordered()

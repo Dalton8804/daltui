@@ -6,6 +6,7 @@ use std::time::Duration;
 use portable_pty::PtySize;
 use ratatui::crossterm::event::{self, Event};
 
+use crate::config::KeyConfig;
 use crate::git::{parse_branches, parse_diff, parse_worktrees, Branch, FileDiff, Worktree};
 use crate::pty::{spawn_pty_session, PtySession};
 use crate::util::{branch_name_for, run_in};
@@ -247,6 +248,7 @@ impl App {
 
     pub fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
         let mut app = App::new();
+        let key_config = KeyConfig::load();
 
         let size = terminal.size()?;
         let content_rows = size.height.saturating_sub(1);
@@ -260,10 +262,10 @@ impl App {
         }
 
         while !app.should_quit {
-            terminal.draw(|frame| ui::render(&app, frame))?;
+            terminal.draw(|frame| ui::render(&app, frame, &key_config))?;
             if event::poll(Duration::from_millis(16))? {
                 match event::read()? {
-                    Event::Key(key) => events::handle_key(&mut app, key),
+                    Event::Key(key) => events::handle_key(&mut app, key, &key_config),
                     Event::Resize(cols, rows) => events::handle_resize(&mut app, cols, rows),
                     _ => {}
                 }
