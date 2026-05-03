@@ -3,6 +3,7 @@ use std::io::Write;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::app::{App, GitTab, InputMode, Pane};
+use crate::config::KeyConfig;
 
 pub fn handle_resize(app: &mut App, total_cols: u16, total_rows: u16) {
     let content_rows = total_rows.saturating_sub(1);
@@ -21,7 +22,7 @@ pub fn handle_resize(app: &mut App, total_cols: u16, total_rows: u16) {
     }
 }
 
-pub fn handle_key(app: &mut App, key: KeyEvent) {
+pub fn handle_key(app: &mut App, key: KeyEvent, kc: &KeyConfig) {
     if key.kind != KeyEventKind::Press {
         return;
     }
@@ -31,34 +32,31 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-            return;
-        }
-        (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
-            let win = app.win_mut();
-            win.focused = match win.focused {
-                Pane::Claude => Pane::Git,
-                Pane::Git => Pane::Terminal,
-                Pane::Terminal => Pane::Claude,
-            };
-            return;
-        }
-        (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
-            app.next_window();
-            return;
-        }
-        (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-            app.prev_window();
-            return;
-        }
-        (KeyCode::Char('x'), KeyModifiers::CONTROL) => {
-            let idx = app.active;
-            app.close_window(idx);
-            return;
-        }
-        _ => {}
+    if kc.global.quit.matches(key.code, key.modifiers) {
+        app.should_quit = true;
+        return;
+    }
+    if kc.global.cycle_pane.matches(key.code, key.modifiers) {
+        let win = app.win_mut();
+        win.focused = match win.focused {
+            Pane::Claude => Pane::Git,
+            Pane::Git => Pane::Terminal,
+            Pane::Terminal => Pane::Claude,
+        };
+        return;
+    }
+    if kc.global.next_window.matches(key.code, key.modifiers) {
+        app.next_window();
+        return;
+    }
+    if kc.global.prev_window.matches(key.code, key.modifiers) {
+        app.prev_window();
+        return;
+    }
+    if kc.global.close_window.matches(key.code, key.modifiers) {
+        let idx = app.active;
+        app.close_window(idx);
+        return;
     }
 
     match app.win().focused {
@@ -78,7 +76,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 }
             }
         }
-        Pane::Git => handle_git_key(app, key),
+        Pane::Git => handle_git_key(app, key, kc),
     }
 }
 
@@ -147,44 +145,41 @@ fn handle_input_mode(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_git_key(app: &mut App, key: KeyEvent) {
+fn handle_git_key(app: &mut App, key: KeyEvent, kc: &KeyConfig) {
     use KeyCode::*;
     use KeyModifiers as KM;
 
     if app.win().git_tab == GitTab::Worktrees {
-        match (key.code, key.modifiers) {
-            (Enter, _) => {
-                let path = app
-                    .win()
-                    .git_worktrees
-                    .get(app.win().worktree_selected)
-                    .map(|wt| wt.path.clone());
-                if let Some(p) = path {
-                    app.open_window(p);
+        if kc.git.open.matches(key.code, key.modifiers) {
+            let path = app
+                .win()
+                .git_worktrees
+                .get(app.win().worktree_selected)
+                .map(|wt| wt.path.clone());
+            if let Some(p) = path {
+                app.open_window(p);
+            }
+            return;
+        }
+        if kc.git.new_worktree.matches(key.code, key.modifiers) {
+            app.input_mode = Some(InputMode::NewWorktree);
+            app.input_buf.clear();
+            return;
+        }
+        if kc.git.delete.matches(key.code, key.modifiers) {
+            let sel = app.win().worktree_selected;
+            if let Some(wt) = app.win().git_worktrees.get(sel) {
+                if wt.path != app.win().path {
+                    app.input_mode =
+                        Some(InputMode::ConfirmDelete(wt.path.clone(), wt.name.clone()));
                 }
-                return;
             }
-            (Char('t'), KM::CONTROL) => {
-                app.input_mode = Some(InputMode::NewWorktree);
-                app.input_buf.clear();
-                return;
-            }
-            (Char('d'), KM::NONE) => {
-                let sel = app.win().worktree_selected;
-                if let Some(wt) = app.win().git_worktrees.get(sel) {
-                    if wt.path != app.win().path {
-                        app.input_mode =
-                            Some(InputMode::ConfirmDelete(wt.path.clone(), wt.name.clone()));
-                    }
-                }
-                return;
-            }
-            _ => {}
+            return;
         }
     }
 
     if app.win().git_tab == GitTab::Branches {
-        if let (Char('d'), KM::NONE) = (key.code, key.modifiers) {
+        if kc.git.delete.matches(key.code, key.modifiers) {
             let sel = app.win().branch_selected;
             if let Some(branch) = app.win().git_branches.get(sel) {
                 if !branch.is_current {
@@ -195,21 +190,37 @@ fn handle_git_key(app: &mut App, key: KeyEvent) {
         }
     }
 
+    // Ctrl+C and q as fallback quit in git pane (vim-style)
     match (key.code, key.modifiers) {
         (Char('c'), KM::CONTROL) | (Char('q'), KM::NONE) => app.should_quit = true,
         _ => {}
     }
 
     let win = app.win_mut();
+
+    if kc.diff.fullscreen.matches(key.code, key.modifiers) {
+        win.fullscreen = !win.fullscreen;
+        win.diff_content_scroll = 0;
+        return;
+    }
+    if kc.git.refresh.matches(key.code, key.modifiers) {
+        win.refresh();
+        return;
+    }
+    if kc.diff.explorer.matches(key.code, key.modifiers) && win.git_tab == GitTab::Diff {
+        win.diff_show_list = !win.diff_show_list;
+        return;
+    }
+    if kc.diff.scroll_down.matches(key.code, key.modifiers) {
+        win.scroll_down(20);
+        return;
+    }
+    if kc.diff.scroll_up.matches(key.code, key.modifiers) {
+        win.scroll_up(20);
+        return;
+    }
+
     match (key.code, key.modifiers) {
-        (Char('f'), KM::CONTROL) => {
-            win.fullscreen = !win.fullscreen;
-            win.diff_content_scroll = 0;
-        }
-        (Char('r'), KM::CONTROL) => win.refresh(),
-        (Char('e'), KM::NONE) if win.git_tab == GitTab::Diff => {
-            win.diff_show_list = !win.diff_show_list;
-        }
         (Right, _) => win.git_tab = win.git_tab.next(),
         (Left, _) => win.git_tab = win.git_tab.prev(),
         (Up, _) if win.git_tab == GitTab::Worktrees => {
@@ -230,8 +241,6 @@ fn handle_git_key(app: &mut App, key: KeyEvent) {
         (Down, _) if win.git_tab == GitTab::Diff && win.diff_show_list => win.diff_select_next(),
         (Up, _) => win.scroll_up(1),
         (Down, _) => win.scroll_down(1),
-        (Char('k'), KM::NONE) => win.scroll_up(20),
-        (Char('j'), KM::NONE) => win.scroll_down(20),
         _ => {}
     }
 }

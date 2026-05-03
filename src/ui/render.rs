@@ -4,10 +4,11 @@ use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
 use ratatui::Frame;
 
 use crate::app::{App, InputMode, Pane};
+use crate::config::KeyConfig;
 use crate::ui::git_pane::render_git_pane;
 use crate::ui::pty_pane::{render_claude_pane, render_terminal_pane};
 
-pub fn render(app: &App, frame: &mut Frame) {
+pub fn render(app: &App, frame: &mut Frame, keys: &KeyConfig) {
     let [winbar_area, content_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(frame.area());
 
@@ -26,6 +27,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             normal,
             active,
             &app.open_paths(),
+            keys,
         );
         return;
     }
@@ -36,7 +38,7 @@ pub fn render(app: &App, frame: &mut Frame) {
     let [git_area, term_area] =
         Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(right);
 
-    render_claude_pane(win, frame, left, win.focused == Pane::Claude, normal, active);
+    render_claude_pane(win, frame, left, win.focused == Pane::Claude, normal, active, keys);
     render_git_pane(
         win,
         frame,
@@ -45,8 +47,9 @@ pub fn render(app: &App, frame: &mut Frame) {
         normal,
         active,
         &app.open_paths(),
+        keys,
     );
-    render_terminal_pane(win, frame, term_area, win.focused == Pane::Terminal, normal, active);
+    render_terminal_pane(win, frame, term_area, win.focused == Pane::Terminal, normal, active, keys);
 
     if app.input_mode.is_some() {
         render_input_prompt(app, frame);
