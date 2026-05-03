@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use crate::app::Window;
+use crate::config::KeyConfig;
 use crate::pty::PtySession;
 
 pub fn render_claude_pane(
@@ -14,9 +15,18 @@ pub fn render_claude_pane(
     focused: bool,
     normal: Style,
     active: Style,
+    keys: &KeyConfig,
 ) {
     let border_style = if focused { active } else { normal };
-    let hint = if focused { " ^W pane  ^Q quit " } else { "" };
+    let hint = if focused {
+        format!(
+            " {} pane  {} quit ",
+            keys.pty.cycle_pane.display(),
+            keys.pty.quit.display()
+        )
+    } else {
+        String::new()
+    };
     let title = if focused { format!(" {} * ", win.name) } else { format!(" {} ", win.name) };
     render_pty_pane(
         win.claude.as_ref(),
@@ -24,7 +34,7 @@ pub fn render_claude_pane(
         area,
         focused,
         title,
-        hint,
+        &hint,
         border_style,
         "Failed to start claude CLI.\nEnsure `claude` is on PATH.",
     );
@@ -37,9 +47,18 @@ pub fn render_terminal_pane(
     focused: bool,
     normal: Style,
     active: Style,
+    keys: &KeyConfig,
 ) {
     let border_style = if focused { active } else { normal };
-    let hint = if focused { " ^W pane  ^Q quit " } else { "" };
+    let hint = if focused {
+        format!(
+            " {} pane  {} quit ",
+            keys.pty.cycle_pane.display(),
+            keys.pty.quit.display()
+        )
+    } else {
+        String::new()
+    };
     let title = if focused { " Terminal * ".to_string() } else { " Terminal ".to_string() };
     render_pty_pane(
         win.terminal.as_ref(),
@@ -47,7 +66,7 @@ pub fn render_terminal_pane(
         area,
         focused,
         title,
-        hint,
+        &hint,
         border_style,
         "Failed to start shell.\nCheck $SHELL.",
     );
